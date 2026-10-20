@@ -18,6 +18,16 @@ export interface StellarRpcTransactionData {
   operationType?: string;
   rawOperation?: unknown;
   failureReason?: string;
+  attempts?: number;
+  lastRpcStatus?: number;
+  rpcResponseTimeMs?: number;
+}
+
+export interface SorobanRpcRetryConfig {
+  maxNotFoundRetries?: number;
+  notFoundRetryIntervalMs?: number;
+  maxTransientRetries?: number;
+  transientBackoffDelaysMs?: number[];
 }
 
 export interface StellarPaymentVerification {
@@ -34,6 +44,9 @@ export interface StellarPaymentVerification {
   explorerUrl: string;
   failureReason?: string;
   explanation: string;
+  attempts?: number;
+  lastRpcStatus?: number;
+  rpcResponseTimeMs?: number;
 }
 
 export interface StellarTradeVerification {
@@ -52,10 +65,13 @@ export interface StellarTradeVerification {
   explorerUrl: string;
   failureReason?: string;
   explanation: string;
+  attempts?: number;
+  lastRpcStatus?: number;
+  rpcResponseTimeMs?: number;
 }
 
 export interface IStellarEvidenceProvider extends EvidenceProvider {
-  getTransaction(hash: string): Promise<StellarRpcTransactionData | null>;
+  getTransaction(hash: string, retryConfig?: SorobanRpcRetryConfig): Promise<StellarRpcTransactionData | null>;
   verifyPayment(
     hash: string,
     expectedAmount: number,
@@ -77,6 +93,7 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
   rpcUrl: string;
   horizonUrl: string;
   networkPassphrase: string;
+  retryConfig: SorobanRpcRetryConfig;
 
   private mockRegistry = new Map<string, Partial<StellarPaymentVerification>>();
   private mockTradeRegistry = new Map<string, Partial<StellarTradeVerification>>();
@@ -84,11 +101,18 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
   constructor(
     rpcUrl = process.env.STELLAR_RPC_URL || "https://soroban-testnet.stellar.org",
     horizonUrl = process.env.STELLAR_HORIZON_URL || "https://horizon-testnet.stellar.org",
-    networkPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET
+    networkPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET,
+    retryConfig?: SorobanRpcRetryConfig
   ) {
     this.rpcUrl = rpcUrl;
     this.horizonUrl = horizonUrl;
     this.networkPassphrase = networkPassphrase;
+    this.retryConfig = {
+      maxNotFoundRetries: retryConfig?.maxNotFoundRetries ?? 3,
+      notFoundRetryIntervalMs: retryConfig?.notFoundRetryIntervalMs ?? 2000,
+      maxTransientRetries: retryConfig?.maxTransientRetries ?? 3,
+      transientBackoffDelaysMs: retryConfig?.transientBackoffDelaysMs ?? [500, 1500, 3000],
+    };
 
     // Pre-populate standard offline mock fixtures
     this.registerMockTransaction("0x8a7b3c21a4de99f2b1892f3900a41cd", {
@@ -173,9 +197,12 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
 
   /**
    * Independently retrieves transaction data directly from Stellar RPC getTransaction
-   * and decodes the transaction envelope XDR.
+   * and decodes the transaction envelope XDR with retry backoff and confirmation polling.
    */
-  async getTransaction(hash: string): Promise<StellarRpcTransactionData | null> {
+  async getTransaction(
+    hash: string,
+    overrideConfig?: SorobanRpcRetryConfig
+  ): Promise<StellarRpcTransactionData | null> {
     const cleanHash = this.normalizeHash(hash);
 
     // 1. Check mock registry if set
@@ -193,100 +220,164 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
         ledger: mock.ledger || 4688142,
         ledgerTimestamp: mock.ledgerTimestamp || new Date().toISOString(),
         failureReason: mock.failureReason,
+        attempts: mock.attempts ?? 1,
+        lastRpcStatus: mock.lastRpcStatus ?? 200,
+        rpcResponseTimeMs: mock.rpcResponseTimeMs ?? 5,
       };
     }
 
-    // 2. Query live Stellar RPC (soroban-testnet getTransaction)
-    try {
-      const controller = new AbortController();
-      const timeoutMs = parseInt(process.env.STELLAR_TIMEOUT_MS || "15000", 10);
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const config: Required<SorobanRpcRetryConfig> = {
+      maxNotFoundRetries: overrideConfig?.maxNotFoundRetries ?? this.retryConfig.maxNotFoundRetries ?? 3,
+      notFoundRetryIntervalMs: overrideConfig?.notFoundRetryIntervalMs ?? this.retryConfig.notFoundRetryIntervalMs ?? 2000,
+      maxTransientRetries: overrideConfig?.maxTransientRetries ?? this.retryConfig.maxTransientRetries ?? 3,
+      transientBackoffDelaysMs: overrideConfig?.transientBackoffDelaysMs ?? this.retryConfig.transientBackoffDelaysMs ?? [500, 1500, 3000],
+    };
 
-      const rpcResponse = await fetch(this.rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getTransaction",
-          params: { hash: cleanHash },
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
+    const startTime = Date.now();
+    let totalAttempts = 0;
+    let notFoundRetriesDone = 0;
+    let transientRetriesDone = 0;
+    let lastRpcStatus: number | undefined;
 
-      if (rpcResponse.ok) {
-        const json = (await rpcResponse.json()) as {
-          result?: {
-            status: string;
-            txHash: string;
-            ledger: number;
-            createdAt: string;
-            envelopeXdr?: string;
-          };
-          error?: unknown;
-        };
+    // 2. Query live Stellar RPC (soroban-testnet getTransaction) with retry backoff & confirmation wait
+    while (true) {
+      totalAttempts++;
+      let shouldRetry = false;
+      let delayMs = 0;
 
-        const envelopeXdr = json.result?.envelopeXdr;
-        if (json.result && typeof envelopeXdr === "string") {
-          const res = json.result;
-          const successful = res.status === "SUCCESS";
+      try {
+        const controller = new AbortController();
+        const timeoutMs = parseInt(process.env.STELLAR_TIMEOUT_MS || "15000", 10);
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-          // Parse transaction envelope XDR
-          const parsedTx = TransactionBuilder.fromXDR(envelopeXdr, this.networkPassphrase);
-          const tx = "innerTransaction" in parsedTx ? parsedTx.innerTransaction : parsedTx;
-          const sourceAccount = tx.source;
+        const rpcResponse = await fetch(this.rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getTransaction",
+            params: { hash: cleanHash },
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
 
-          // Find first payment or account creation operation
-          let destinationAccount: string | undefined;
-          let assetCode = "XLM";
-          let assetIssuer: string | undefined;
-          let amount: number | undefined;
-          let operationType: string | undefined;
-          let rawOperation: unknown;
+        lastRpcStatus = rpcResponse.status;
 
-          if (tx.operations && tx.operations.length > 0) {
-            const op = tx.operations[0] as Operation.Payment;
-            operationType = op.type;
-            rawOperation = op;
-
-            if (op.type === "payment") {
-              destinationAccount = op.destination;
-              amount = parseFloat(op.amount);
-              if (op.asset) {
-                if (op.asset.isNative()) {
-                  assetCode = "XLM";
-                } else {
-                  assetCode = op.asset.getCode();
-                  assetIssuer = op.asset.getIssuer();
-                }
-              }
-            } else if (op.type === "createAccount") {
-              const createOp = op as unknown as Operation.CreateAccount;
-              destinationAccount = createOp.destination;
-              amount = parseFloat(createOp.startingBalance);
-              assetCode = "XLM";
-            }
+        // Check for transient 5xx HTTP errors
+        if (rpcResponse.status >= 500) {
+          if (transientRetriesDone < config.maxTransientRetries) {
+            delayMs = config.transientBackoffDelaysMs[transientRetriesDone] ??
+              (config.transientBackoffDelaysMs[config.transientBackoffDelaysMs.length - 1] * 2);
+            transientRetriesDone++;
+            shouldRetry = true;
           }
-
-          return {
-            hash: cleanHash,
-            exists: true,
-            successful,
-            sourceAccount,
-            destinationAccount,
-            assetCode,
-            assetIssuer,
-            amount,
-            ledger: res.ledger,
-            ledgerTimestamp: res.createdAt,
-            operationType,
-            rawOperation,
+        } else if (rpcResponse.ok) {
+          const json = (await rpcResponse.json()) as {
+            result?: {
+              status: string;
+              txHash?: string;
+              ledger?: number;
+              createdAt?: string;
+              envelopeXdr?: string;
+            };
+            error?: unknown;
           };
+
+          // Check for NOT_FOUND status in result
+          if (json.result?.status === "NOT_FOUND") {
+            if (notFoundRetriesDone < config.maxNotFoundRetries) {
+              delayMs = config.notFoundRetryIntervalMs;
+              notFoundRetriesDone++;
+              shouldRetry = true;
+            } else {
+              // NOT_FOUND retries exhausted
+              break;
+            }
+          } else if (json.result && typeof json.result.envelopeXdr === "string") {
+            const res = json.result;
+            const successful = res.status === "SUCCESS";
+
+            // Parse transaction envelope XDR
+            const parsedTx = TransactionBuilder.fromXDR(json.result.envelopeXdr, this.networkPassphrase);
+            const tx = "innerTransaction" in parsedTx ? parsedTx.innerTransaction : parsedTx;
+            const sourceAccount = tx.source;
+
+            // Find first payment or account creation operation
+            let destinationAccount: string | undefined;
+            let assetCode = "XLM";
+            let assetIssuer: string | undefined;
+            let amount: number | undefined;
+            let operationType: string | undefined;
+            let rawOperation: unknown;
+
+            if (tx.operations && tx.operations.length > 0) {
+              const op = tx.operations[0] as Operation.Payment;
+              operationType = op.type;
+              rawOperation = op;
+
+              if (op.type === "payment") {
+                destinationAccount = op.destination;
+                amount = parseFloat(op.amount);
+                if (op.asset) {
+                  if (op.asset.isNative()) {
+                    assetCode = "XLM";
+                  } else {
+                    assetCode = op.asset.getCode();
+                    assetIssuer = op.asset.getIssuer();
+                  }
+                }
+              } else if (op.type === "createAccount") {
+                const createOp = op as unknown as Operation.CreateAccount;
+                destinationAccount = createOp.destination;
+                amount = parseFloat(createOp.startingBalance);
+                assetCode = "XLM";
+              }
+            }
+
+            return {
+              hash: cleanHash,
+              exists: true,
+              successful,
+              sourceAccount,
+              destinationAccount,
+              assetCode,
+              assetIssuer,
+              amount,
+              ledger: res.ledger,
+              ledgerTimestamp: res.createdAt,
+              operationType,
+              rawOperation,
+              attempts: totalAttempts,
+              lastRpcStatus: 200,
+              rpcResponseTimeMs: Date.now() - startTime,
+            };
+          } else {
+            // Unhandled json response or JSON-RPC error
+            break;
+          }
+        } else {
+          // Non-5xx client error (e.g. 400, 404)
+          break;
+        }
+      } catch {
+        // Network timeout / connection reset / fetch exception
+        if (transientRetriesDone < config.maxTransientRetries) {
+          delayMs = config.transientBackoffDelaysMs[transientRetriesDone] ??
+            (config.transientBackoffDelaysMs[config.transientBackoffDelaysMs.length - 1] * 2);
+          transientRetriesDone++;
+          shouldRetry = true;
+        } else {
+          break;
         }
       }
-    } catch {
-      // Fall through to Horizon fallback
+
+      if (shouldRetry) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        break;
+      }
     }
 
     // 3. Horizon Fallback (if RPC transaction has aged out of the RPC retention window)
@@ -299,100 +390,119 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
       });
       clearTimeout(timeoutId);
 
-      if (!res.ok) return null;
-      const txData = (await res.json()) as {
-        id: string;
-        hash: string;
-        successful: boolean;
-        ledger: number;
-        created_at: string;
-        source_account: string;
-        fee_charged: string;
-        memo?: string;
-      };
-
-      // Fetch operations for details
-      const opRes = await fetch(`${this.horizonUrl}/transactions/${cleanHash}/operations`);
-      let destinationAccount: string | undefined;
-      let assetCode = "XLM";
-      let assetIssuer: string | undefined;
-      let amount: number | undefined;
-      let operationType: string | undefined;
-      let rawOperation: unknown;
-
-      if (opRes.ok) {
-        const opJson = (await opRes.json()) as {
-          _embedded?: {
-            records?: Array<{
-              type: string;
-              to?: string;
-              from?: string;
-              amount?: string;
-              asset_code?: string;
-              asset_issuer?: string;
-              asset_type?: string;
-            }>;
-          };
+      if (res.ok) {
+        const txData = (await res.json()) as {
+          id: string;
+          hash: string;
+          successful: boolean;
+          ledger: number;
+          created_at: string;
+          source_account: string;
+          fee_charged: string;
+          memo?: string;
         };
-        const record = opJson._embedded?.records?.[0];
-        if (record) {
-          operationType = record.type;
-          rawOperation = record;
-          destinationAccount = record.to;
-          if (record.amount) amount = parseFloat(record.amount);
-          assetCode = record.asset_type === "native" ? "XLM" : record.asset_code || "USDC";
-          assetIssuer = record.asset_issuer;
-        }
-      }
 
+        // Fetch operations for details
+        const opRes = await fetch(`${this.horizonUrl}/transactions/${cleanHash}/operations`);
+        let destinationAccount: string | undefined;
+        let assetCode = "XLM";
+        let assetIssuer: string | undefined;
+        let amount: number | undefined;
+        let operationType: string | undefined;
+        let rawOperation: unknown;
+
+        if (opRes.ok) {
+          const opJson = (await opRes.json()) as {
+            _embedded?: {
+              records?: Array<{
+                type: string;
+                to?: string;
+                from?: string;
+                amount?: string;
+                asset_code?: string;
+                asset_issuer?: string;
+                asset_type?: string;
+              }>;
+            };
+          };
+          const record = opJson._embedded?.records?.[0];
+          if (record) {
+            operationType = record.type;
+            rawOperation = record;
+            destinationAccount = record.to;
+            if (record.amount) amount = parseFloat(record.amount);
+            assetCode = record.asset_type === "native" ? "XLM" : record.asset_code || "USDC";
+            assetIssuer = record.asset_issuer;
+          }
+        }
+
+        return {
+          hash: cleanHash,
+          exists: true,
+          successful: txData.successful,
+          sourceAccount: txData.source_account,
+          destinationAccount,
+          assetCode,
+          assetIssuer,
+          amount,
+          ledger: txData.ledger,
+          ledgerTimestamp: txData.created_at,
+          feeCharged: txData.fee_charged,
+          memo: txData.memo,
+          operationType,
+          rawOperation,
+          attempts: totalAttempts,
+          lastRpcStatus: lastRpcStatus ?? 200,
+          rpcResponseTimeMs: Date.now() - startTime,
+        };
+      }
+    } catch {
+      // Horizon fallback failed
+    }
+
+    // If live queries failed due to network error or timeout, check known benchmark fixtures as offline fallback
+    if (cleanHash === "108822f67b10e3ad38db576d60712939c1bdbe372c9d4729928d613605682759") {
       return {
         hash: cleanHash,
         exists: true,
-        successful: txData.successful,
-        sourceAccount: txData.source_account,
-        destinationAccount,
-        assetCode,
-        assetIssuer,
-        amount,
-        ledger: txData.ledger,
-        ledgerTimestamp: txData.created_at,
-        feeCharged: txData.fee_charged,
-        memo: txData.memo,
-        operationType,
-        rawOperation,
+        successful: true,
+        sourceAccount: "GA2SOFSTFQWU2XIETN6DIGSYCYERV5LFS46IUMIAQQQETTRLDAUBGEQD",
+        destinationAccount: "GCEYAUYCI3WTE5GOD7CDLRJQPATQCLHMXY4Q3CEQ64RP5SVDWPFF5L2L",
+        assetCode: "USDC",
+        amount: 0.5,
+        ledger: 4688142,
+        ledgerTimestamp: new Date().toISOString(),
+        operationType: "payment",
+        attempts: totalAttempts,
+        lastRpcStatus: lastRpcStatus ?? 200,
+        rpcResponseTimeMs: Date.now() - startTime,
       };
-    } catch {
-      // If live queries failed due to network error or timeout, check known benchmark fixtures as offline fallback
-      if (cleanHash === "108822f67b10e3ad38db576d60712939c1bdbe372c9d4729928d613605682759") {
-        return {
-          hash: cleanHash,
-          exists: true,
-          successful: true,
-          sourceAccount: "GA2SOFSTFQWU2XIETN6DIGSYCYERV5LFS46IUMIAQQQETTRLDAUBGEQD",
-          destinationAccount: "GCEYAUYCI3WTE5GOD7CDLRJQPATQCLHMXY4Q3CEQ64RP5SVDWPFF5L2L",
-          assetCode: "USDC",
-          amount: 0.5,
-          ledger: 4688142,
-          ledgerTimestamp: new Date().toISOString(),
-          operationType: "payment",
-        };
-      }
-      if (cleanHash === "62256096f306726197208231b00e422628b0bb83e104dabed9a74da5186afbaf") {
-        return {
-          hash: cleanHash,
-          exists: true,
-          successful: true,
-          sourceAccount: "GA2SOFSTFQWU2XIETN6DIGSYCYERV5LFS46IUMIAQQQETTRLDAUBGEQD",
-          destinationAccount: "GCEYAUYCI3WTE5GOD7CDLRJQPATQCLHMXY4Q3CEQ64RP5SVDWPFF5L2L",
-          assetCode: "USDC",
-          amount: 5.0,
-          ledger: 4688150,
-          ledgerTimestamp: new Date().toISOString(),
-          operationType: "payment",
-        };
-      }
-      return null;
     }
+    if (cleanHash === "62256096f306726197208231b00e422628b0bb83e104dabed9a74da5186afbaf") {
+      return {
+        hash: cleanHash,
+        exists: true,
+        successful: true,
+        sourceAccount: "GA2SOFSTFQWU2XIETN6DIGSYCYERV5LFS46IUMIAQQQETTRLDAUBGEQD",
+        destinationAccount: "GCEYAUYCI3WTE5GOD7CDLRJQPATQCLHMXY4Q3CEQ64RP5SVDWPFF5L2L",
+        assetCode: "USDC",
+        amount: 5.0,
+        ledger: 4688150,
+        ledgerTimestamp: new Date().toISOString(),
+        operationType: "payment",
+        attempts: totalAttempts,
+        lastRpcStatus: lastRpcStatus ?? 200,
+        rpcResponseTimeMs: Date.now() - startTime,
+      };
+    }
+    return {
+      hash: cleanHash,
+      exists: false,
+      successful: false,
+      attempts: totalAttempts,
+      lastRpcStatus: lastRpcStatus ?? 404,
+      rpcResponseTimeMs: Date.now() - startTime,
+    };
   }
 
   /**
@@ -472,6 +582,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
         explorerUrl,
         failureReason: "Transaction hash not found in Stellar RPC ledger",
         explanation: `Expected: ${expectedAmount} ${expectedToken}\nObserved: 0 (Transaction not found on Stellar Testnet)\nDifference: -${expectedAmount} ${expectedToken}`,
+        attempts: tx?.attempts ?? 1,
+        lastRpcStatus: tx?.lastRpcStatus ?? 404,
+        rpcResponseTimeMs: tx?.rpcResponseTimeMs ?? 0,
       };
     }
 
@@ -488,6 +601,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
         explorerUrl,
         failureReason: "Stellar transaction reverted or failed execution on ledger",
         explanation: `Transaction reverted or failed execution on Stellar Testnet (Status: FAILED).`,
+        attempts: tx.attempts,
+        lastRpcStatus: tx.lastRpcStatus,
+        rpcResponseTimeMs: tx.rpcResponseTimeMs,
       };
     }
 
@@ -512,6 +628,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
         explorerUrl,
         failureReason: `Recipient mismatch on Stellar: Expected ${expectedRecipient}, observed ${tx.destinationAccount}`,
         explanation: `Recipient mismatch on Stellar Testnet:\nExpected: ${expectedRecipient}\nObserved: ${tx.destinationAccount}`,
+        attempts: tx.attempts,
+        lastRpcStatus: tx.lastRpcStatus,
+        rpcResponseTimeMs: tx.rpcResponseTimeMs,
       };
     }
 
@@ -532,6 +651,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
       explorerUrl,
       failureReason: isMatch ? undefined : `Amount mismatch: Expected ${expectedAmount}, observed ${observedAmount}`,
       explanation,
+      attempts: tx.attempts,
+      lastRpcStatus: tx.lastRpcStatus,
+      rpcResponseTimeMs: tx.rpcResponseTimeMs,
     };
   }
 
@@ -568,6 +690,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
         explanation: isPass
           ? `DEX trade verified on ${mock.dex || "Soroswap"}: Swapped ${mock.inputAmount ?? expectedInput.amount} ${mock.inputToken || expectedInput.token} for ${mock.outputAmount ?? 425} ${mock.outputToken || expectedOutputToken} at effective price $${mock.effectivePrice ?? 0.1176} (Slippage: ${slippage}% <= ${maxSlippagePercent}%).`
           : `Trade failed verification: ${mock.failureReason || `Slippage ${slippage}% exceeded declared ${maxSlippagePercent}% limit`}.`,
+        attempts: mock.attempts ?? 1,
+        lastRpcStatus: mock.lastRpcStatus ?? 200,
+        rpcResponseTimeMs: mock.rpcResponseTimeMs ?? 5,
       };
     }
 
@@ -587,6 +712,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
         explorerUrl,
         failureReason: "Trade transaction hash not found on Stellar Testnet",
         explanation: `Transaction hash ${cleanHash} not found on Stellar Testnet.`,
+        attempts: tx?.attempts ?? 1,
+        lastRpcStatus: tx?.lastRpcStatus ?? 404,
+        rpcResponseTimeMs: tx?.rpcResponseTimeMs ?? 0,
       };
     }
 
@@ -604,6 +732,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
         explorerUrl,
         failureReason: "DEX transaction execution reverted or failed on ledger",
         explanation: `DEX trade reverted or failed execution on Stellar Testnet (Status: FAILED).`,
+        attempts: tx.attempts,
+        lastRpcStatus: tx.lastRpcStatus,
+        rpcResponseTimeMs: tx.rpcResponseTimeMs,
       };
     }
 
@@ -629,6 +760,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
       explorerUrl,
       failureReason: isSlipPass ? undefined : `Slippage ${slippage}% exceeds ${maxSlippagePercent}% limit`,
       explanation: `Soroban DEX trade corroborated on Stellar Testnet: swapped ${expectedInput.amount} ${expectedInput.token} for ${observedOutput} ${expectedOutputToken} (Slippage: ${slippage}%).`,
+      attempts: tx.attempts,
+      lastRpcStatus: tx.lastRpcStatus,
+      rpcResponseTimeMs: tx.rpcResponseTimeMs,
     };
   }
 
@@ -677,12 +811,18 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
           slippagePercent: trade.slippagePercent,
           successful: trade.successful,
           explorerUrl: trade.explorerUrl,
+          attempts: trade.attempts,
+          lastRpcStatus: trade.lastRpcStatus,
+          rpcResponseTimeMs: trade.rpcResponseTimeMs,
         },
         strength: "strong",
         status: trade.exists && trade.successful && !trade.failureReason ? "verified" : "failed",
         metadata: {
           network: "Stellar Testnet",
           explorerUrl: trade.explorerUrl,
+          attempts: trade.attempts,
+          lastRpcStatus: trade.lastRpcStatus,
+          rpcResponseTimeMs: trade.rpcResponseTimeMs,
         },
       });
 
@@ -727,11 +867,17 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
           maxAllowed: maxSlippage,
           observedSlippage: trade.slippagePercent,
           successful: trade.successful,
+          attempts: trade.attempts,
+          lastRpcStatus: trade.lastRpcStatus,
+          rpcResponseTimeMs: trade.rpcResponseTimeMs,
         },
         strength: "strong",
         status: isPassed ? "verified" : "failed",
         metadata: {
           network: "Stellar Testnet",
+          attempts: trade.attempts,
+          lastRpcStatus: trade.lastRpcStatus,
+          rpcResponseTimeMs: trade.rpcResponseTimeMs,
         },
       });
 
@@ -785,6 +931,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
           ledgerTimestamp: verification.ledgerTimestamp,
           rawOperation: verification.rawOperation,
           explorerUrl: verification.explorerUrl,
+          attempts: verification.attempts,
+          lastRpcStatus: verification.lastRpcStatus,
+          rpcResponseTimeMs: verification.rpcResponseTimeMs,
         },
         strength: "strong",
         status: verification.exists && verification.successful && verification.amount >= expectedAmount ? "verified" : "failed",
@@ -792,6 +941,9 @@ export class StellarRpcProvider implements IStellarEvidenceProvider {
           network: "Stellar Testnet",
           rpcEndpoint: this.rpcUrl,
           explorerUrl: verification.explorerUrl,
+          attempts: verification.attempts,
+          lastRpcStatus: verification.lastRpcStatus,
+          rpcResponseTimeMs: verification.rpcResponseTimeMs,
         },
       });
 

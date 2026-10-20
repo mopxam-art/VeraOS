@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "postinstall": "npm run build",
-    "test": "tsx --test server/tests/engine.test.ts server/tests/stellar.test.ts server/tests/stellarRpc.test.ts server/tests/telegram.test.ts server/tests/agentConnect.test.ts server/tests/ai.test.ts server/tests/schemas.test.ts server/tests/enterprise.test.ts server/tests/googleAuth.test.ts server/tests/vercel.test.ts server/tests/telegramWebhook.test.ts server/tests/tradingAgent.test.ts server/tests/logAuditAgent.test.ts",
+    "test": "tsx --test server/tests/engine.test.ts server/tests/stellar.test.ts server/tests/stellarRpc.test.ts server/tests/sorobanRpcRetry.test.ts server/tests/telegram.test.ts server/tests/agentConnect.test.ts server/tests/ai.test.ts server/tests/schemas.test.ts server/tests/enterprise.test.ts server/tests/googleAuth.test.ts server/tests/vercel.test.ts server/tests/telegramWebhook.test.ts server/tests/tradingAgent.test.ts server/tests/logAuditAgent.test.ts",
     "server": "tsx server/api/server.ts",
     "bot": "tsx server/telegram/runner.ts",
     "lint": "oxlint",

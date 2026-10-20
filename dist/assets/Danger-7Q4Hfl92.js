@@ -1,1 +1,0 @@
-import{h as e,t}from"./jsx-dev-runtime-CgP6OxQv.js";import{Account as n}from"./Account-Ddv9QZLv.js";e();var r=t(),i=`C:/Users/User/vera/VeraOS/src/pages/Danger.tsx`,a=()=>(0,r.jsxDEV)(n,{},void 0,!1,{fileName:i,lineNumber:6,columnNumber:10},void 0);export{a as Danger,a as default};

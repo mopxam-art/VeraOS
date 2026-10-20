@@ -1,0 +1,1 @@
+import{h as e,t}from"./jsx-runtime-CSDjvHm_.js";import{Account as n}from"./Account-B5qTLuv3.js";e();var r=t(),i=()=>(0,r.jsx)(n,{});export{i as Danger,i as default};
