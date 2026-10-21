@@ -68,14 +68,101 @@ async function parseJsonBody<T>(req: IncomingMessage): Promise<T> {
   });
 }
 
-// Helper to send JSON responses
-function sendJson(res: ServerResponse, statusCode: number, data: unknown): void {
+// Standard HTTP Security Headers for REST/JSON API
+export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
+  "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; sandbox",
+};
+
+// Safe default trusted origins for local dev and production
+export const DEFAULT_ALLOWED_ORIGINS: readonly string[] = [
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5173",
+  "https://vera-os.vercel.app",
+  "https://vera.os",
+];
+
+// Helper to normalize origin string (strips trailing slashes, normalizes protocol/host)
+export function normalizeOrigin(origin: string): string {
+  try {
+    const url = new URL(origin);
+    return url.origin.toLowerCase();
+  } catch {
+    return origin.trim().replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+// Parse allowed origins from ALLOWED_ORIGINS env variable with safe fallback
+export function getAllowedOrigins(): string[] {
+  const envOrigins = process.env.ALLOWED_ORIGINS;
+  if (envOrigins !== undefined) {
+    return envOrigins
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map(normalizeOrigin);
+  }
+  const fallback = DEFAULT_ALLOWED_ORIGINS.map(normalizeOrigin);
+  if (process.env.VERAOS_API_URL) {
+    try {
+      const parsed = normalizeOrigin(process.env.VERAOS_API_URL);
+      if (!fallback.includes(parsed)) {
+        fallback.push(parsed);
+      }
+    } catch {}
+  }
+  return fallback;
+}
+
+// Validate if an incoming request origin is permitted
+export function isOriginAllowed(origin: string): boolean {
+  if (!origin) return false;
+  const allowed = getAllowedOrigins();
+  if (allowed.includes("*")) {
+    return true;
+  }
+  const normalized = normalizeOrigin(origin);
+  return allowed.includes(normalized);
+}
+
+// Compute dynamic CORS headers based on incoming request origin
+export function getCorsHeaders(req?: IncomingMessage | string): Record<string, string> {
+  const origin = typeof req === "string" ? req : req?.headers?.origin;
+  const headers: Record<string, string> = {
+    Vary: "Origin",
+  };
+
+  if (origin && isOriginAllowed(origin)) {
+    headers["Access-Control-Allow-Origin"] = origin;
+    headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH";
+    headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept, Origin";
+    headers["Access-Control-Max-Age"] = "86400";
+    headers["Access-Control-Allow-Credentials"] = "true";
+  }
+
+  return headers;
+}
+
+// Helper to send JSON responses with strict CORS and security headers
+export function sendJson(
+  res: ServerResponse,
+  statusCode: number,
+  data: unknown,
+  req?: IncomingMessage
+): void {
   const jsonStr = JSON.stringify(data);
+  const actualReq = req || (res as any).__req;
+  const corsHeaders = getCorsHeaders(actualReq);
+
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    ...SECURITY_HEADERS,
+    ...corsHeaders,
   });
   res.end(jsonStr);
 }
@@ -87,6 +174,8 @@ export async function handleApiRequest(
   if (!req.url) {
     return false;
   }
+  (res as any).__req = req;
+
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   let pathname = url.pathname;
   if (pathname.startsWith("/api/verifications")) {
@@ -113,10 +202,10 @@ export async function handleApiRequest(
 
   // Handle CORS Preflight
   if (req.method === "OPTIONS") {
+    const corsHeaders = getCorsHeaders(req);
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      ...SECURITY_HEADERS,
+      ...corsHeaders,
     });
     res.end();
     return true;

@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { handleApiRequest } from "./routes.ts";
+import { handleApiRequest, sendJson } from "./routes.ts";
 import { veraTelegramBot } from "../telegram/bot.ts";
 
 try {
@@ -10,10 +10,10 @@ const PORT = parseInt(process.env.PORT || "3001", 10);
 
 export function startServer(port = PORT) {
   const server = createServer(async (req, res) => {
+    (res as any).__req = req;
     const handled = await handleApiRequest(req, res);
     if (!handled) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Endpoint not found" }));
+      sendJson(res, 404, { error: "Endpoint not found" }, req);
     }
   });
 

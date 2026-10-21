@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { handleApiRequest } from "../server/api/routes.ts";
+import { handleApiRequest, sendJson } from "../server/api/routes.ts";
 
 function resolveTargetUrl(req: IncomingMessage): string {
   // 1. If x-matched-path header exists (Vercel edge proxy provides this)
@@ -52,20 +52,19 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
 
     const handled = await handleApiRequest(req, res);
     if (!handled) {
-      res.statusCode = 404;
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ error: "Endpoint not found", path: req.url }));
+      sendJson(res, 404, { error: "Endpoint not found", path: req.url }, req);
     }
   } catch (error: any) {
     console.error("[Vercel API Gateway Error]:", error);
     if (!res.headersSent) {
-      res.statusCode = 500;
-      res.setHeader("Content-Type", "application/json");
-      res.end(
-        JSON.stringify({
+      sendJson(
+        res,
+        500,
+        {
           error: "Internal server error",
           message: error?.message || "Unknown error",
-        })
+        },
+        req
       );
     }
   }
